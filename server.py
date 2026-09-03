@@ -16,8 +16,12 @@ CMS_LOGIN_PASSWORD = os.getenv("CMS_LOGIN_PASSWORD", "")
 OPERATOR_KEY = os.getenv("NEDS_OPERATOR_API_KEY", "")
 PUBLISH_ENABLED = os.getenv("NEDS_OPERATOR_PUBLISH_ENABLED", "false").lower() == "true"
 PORTAL_SLUG = os.getenv("NEDS_PORTAL_SLUG", "").strip()
+SERVER_HOST = os.getenv("HOST", "0.0.0.0")
+SERVER_PORT = int(os.getenv("PORT", "8080"))
 
 mcp = FastMCP("NEDS India 24x7 News Operator")
+mcp.settings.host = SERVER_HOST
+mcp.settings.port = SERVER_PORT
 
 _token: Optional[str] = None
 
@@ -40,17 +44,19 @@ def _auth(api_key: str) -> None:
         raise PermissionError("Invalid operator API key")
 
 
-async def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=CMS_BASE_URL, timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False)
+def _headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
 
 
 async def _login() -> str:
     global _token
-    _check_config()
     if _token:
         return _token
-    async with await _client() as c:
-        r = await c.post("/api/auth/login", json={"email": CMS_LOGIN_EMAIL, "password": CMS_LOGIN_PASSWORD})
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{CMS_BASE_URL}/api/auth/login",
+            json={"email": CMS_LOGIN_EMAIL, "password": CMS_LOGIN_PASSWORD},
+        )
         r.raise_for_status()
         data = r.json()
         _token = data["access_token"]
@@ -58,193 +64,128 @@ async def _login() -> str:
 
 
 async def _request(method: str, path: str, **kwargs: Any) -> Any:
-    global _token
     token = await _login()
-    headers = dict(kwargs.pop("headers", {}) or {})
-    headers["Authorization"] = f"Bearer {token}"
-    async with await _client() as c:
-        r = await c.request(method, path, headers=headers, **kwargs)
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.request(method, f"{CMS_BASE_URL}{path}", headers=_headers(token), **kwargs)
         if r.status_code == 401:
+            global _token
             _token = None
             token = await _login()
-            headers["Authorization"] = f"Bearer {token}"
-            r = await c.request(method, path, headers=headers, **kwargs)
-        if r.is_error:
-            detail = r.text[:1000]
-            raise RuntimeError(f"CMS {r.status_code}: {detail}")
-        return r.json() if r.content else {"ok": True}
-
-
-def _safe_external_url(url: str) -> None:
-    p = urlparse(url)
-    if p.scheme != "https" or not p.hostname:
-        raise ValueError("Only HTTPS image URLs are allowed")
-    host = p.hostname
-    try:
-        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        ips = {i[4][0] for i in infos}
-        for raw in ips:
-            ip = ipaddress.ip_address(raw)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                raise ValueError("Blocked private/internal image host")
-    except socket.gaierror as e:
-        raise ValueError("Could not resolve image host") from e
+            r = await client.request(method, f"{CMS_BASE_URL}{path}", headers=_headers(token), **kwargs)
+        r.raise_for_status()
+        if not r.content:
+            return {"ok": True}
+        return r.json()
 
 
 @mcp.tool()
 async def get_portal_settings(api_key: str) -> dict:
-    """Return the connected portal settings, including its slug and name."""
+    """Get NEDS India 24x7 portal settings."""
     _auth(api_key)
     return await _request("GET", "/api/portal/settings")
 
 
 @mcp.tool()
-async def get_categories(api_key: str) -> list[dict]:
-    """List categories available in the connected news portal."""
+async def get_categories(api_key: str) -> Any:
+    """List available news categories."""
     _auth(api_key)
     return await _request("GET", "/api/portal/categories")
 
 
 @mcp.tool()
-async def search_existing_news(api_key: str, status: Optional[str] = None, limit: int = 100) -> list[dict]:
-    """Fetch portal news so ChatGPT can check for duplicates before creating an article."""
+async def search_existing_news(api_key: str, limit: int = 100) -> Any:
+    """Fetch recent CMS news for duplicate checking. ChatGPT should compare titles/topics itself."""
     _auth(api_key)
-    limit = max(1, min(limit, 500))
-    params = {"status": status} if status else {}
-    data = await _request("GET", "/api/portal/news", params=params)
+    limit = max(1, min(limit, 100))
+    data = await _request("GET", "/api/portal/news")
     if isinstance(data, list):
         return data[:limit]
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        return data["items"][:limit]
     return data
 
 
 @mcp.tool()
-async def get_news(api_key: str, news_id: str) -> dict:
+async def get_news(api_key: str, news_id: str) -> Any:
     """Get one CMS news item by ID."""
     _auth(api_key)
     return await _request("GET", f"/api/portal/news/{news_id}")
 
 
 @mcp.tool()
-async def create_news(
-    api_key: str,
-    title: str,
-    subtitle: str,
-    body: str,
-    category_id: str,
-    tags: list[str],
-    language: str = "hi",
-    location: Optional[str] = None,
-    breaking: bool = False,
-    cover_image: Optional[str] = None,
-    video_url: Optional[str] = None,
-    documents: Optional[list[str]] = None,
-    gallery: Optional[list[str]] = None,
-) -> dict:
-    """Create a draft news item. Does not publish it."""
+async def create_news(api_key: str, news: dict) -> Any:
+    """Create a news article as a CMS draft."""
     _auth(api_key)
-    payload = {
-        "title": title, "subtitle": subtitle, "body": body,
-        "category_id": category_id, "tags": tags, "language": language,
-        "breaking": breaking,
-    }
-    if location is not None: payload["location"] = location
-    if cover_image is not None: payload["cover_image"] = cover_image
-    if video_url is not None: payload["video_url"] = video_url
-    if documents is not None: payload["documents"] = documents
-    if gallery is not None: payload["gallery"] = gallery
-    return await _request("POST", "/api/portal/news", json=payload)
+    return await _request("POST", "/api/portal/news", json=news)
 
 
 @mcp.tool()
-async def update_news(
-    api_key: str,
-    news_id: str,
-    title: Optional[str] = None,
-    subtitle: Optional[str] = None,
-    body: Optional[str] = None,
-    category_id: Optional[str] = None,
-    tags: Optional[list[str]] = None,
-    location: Optional[str] = None,
-    breaking: Optional[bool] = None,
-    trending: Optional[bool] = None,
-    cover_image: Optional[str] = None,
-    video_url: Optional[str] = None,
-    seo_title: Optional[str] = None,
-    seo_description: Optional[str] = None,
-    keywords: Optional[list[str]] = None,
-) -> dict:
-    """Update an existing news item, including SEO fields."""
+async def update_news(api_key: str, news_id: str, news: dict) -> Any:
+    """Update a CMS news article."""
     _auth(api_key)
-    fields = locals().copy()
-    fields.pop("api_key", None); fields.pop("news_id", None)
-    payload = {k: v for k, v in fields.items() if v is not None}
-    return await _request("PATCH", f"/api/portal/news/{news_id}", json=payload)
+    return await _request("PATCH", f"/api/portal/news/{news_id}", json=news)
 
 
 @mcp.tool()
-async def upload_media_from_url(api_key: str, image_url: str, kind: str = "news") -> dict:
-    """Download a public HTTPS image and upload it to the CMS media endpoint."""
+async def upload_media_from_url(api_key: str, image_url: str, filename: str = "cover.jpg") -> Any:
+    """Download an HTTPS image from a public host and upload it to the CMS media endpoint."""
     _auth(api_key)
-    _safe_external_url(image_url)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0), follow_redirects=False) as ext:
-        r = await ext.get(image_url)
+    parsed = urlparse(image_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("Only HTTPS image URLs are allowed")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+        for info in infos:
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                raise ValueError("Private or internal image hosts are not allowed")
+    except socket.gaierror as exc:
+        raise ValueError("Could not resolve image host") from exc
+
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        r = await client.get(image_url)
         r.raise_for_status()
-        if len(r.content) > 12 * 1024 * 1024:
+        content = r.content
+        if len(content) > 12 * 1024 * 1024:
             raise ValueError("Image exceeds 12 MB limit")
-        content_type = (r.headers.get("content-type") or "").split(";")[0].lower()
-        if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
-            raise ValueError("URL did not return a supported image type")
-        filename = image_url.split("/")[-1].split("?")[0] or "cover-image"
+        content_type = r.headers.get("content-type", "image/jpeg").split(";")[0].lower()
+        allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+        if content_type not in allowed:
+            raise ValueError(f"Unsupported image content type: {content_type}")
+
     token = await _login()
-    async with await _client() as c:
-        rr = await c.post(
-            "/api/media/upload", params={"kind": kind},
-            headers={"Authorization": f"Bearer {token}"},
-            files={"file": (filename, r.content, content_type)},
-        )
-        if rr.status_code == 401:
-            global _token
-            _token = None
-            token = await _login()
-            rr = await c.post("/api/media/upload", params={"kind": kind}, headers={"Authorization": f"Bearer {token}"}, files={"file": (filename, r.content, content_type)})
-        if rr.is_error:
-            raise RuntimeError(f"CMS {rr.status_code}: {rr.text[:1000]}")
-        return rr.json()
+    async with httpx.AsyncClient(timeout=60) as client:
+        files = {"file": (filename, content, content_type)}
+        r = await client.post(f"{CMS_BASE_URL}/api/media/upload", headers=_headers(token), files=files)
+        r.raise_for_status()
+        return r.json()
 
 
 @mcp.tool()
-async def submit_news(api_key: str, news_id: str) -> dict:
-    """Submit a created news item into the CMS review workflow."""
+async def submit_news(api_key: str, news_id: str) -> Any:
+    """Submit a draft news item for CMS review."""
     _auth(api_key)
     return await _request("POST", f"/api/portal/news/{news_id}/submit")
 
 
 @mcp.tool()
-async def publish_news(api_key: str, news_id: str) -> dict:
+async def publish_news(api_key: str, news_id: str) -> Any:
     """Publish a news item. Disabled until NEDS_OPERATOR_PUBLISH_ENABLED=true."""
     _auth(api_key)
     if not PUBLISH_ENABLED:
-        raise PermissionError("Publishing is disabled on this connector")
+        raise PermissionError("Publishing is disabled on this operator")
     return await _request("POST", f"/api/portal/news/{news_id}/publish")
 
 
 @mcp.tool()
-async def verify_published_news(api_key: str, news_id: str) -> dict:
-    """Verify the public portal response for a published news item."""
+async def verify_published_news(api_key: str, news_id: str) -> Any:
+    """Verify the public CMS response for a news item."""
     _auth(api_key)
-    slug = PORTAL_SLUG
-    if not slug:
-        settings = await _request("GET", "/api/portal/settings")
-        slug = settings.get("slug", "")
-    if not slug:
-        raise RuntimeError("Portal slug is not configured or available")
-    async with httpx.AsyncClient(base_url=CMS_BASE_URL, timeout=20.0, follow_redirects=False) as c:
-        r = await c.get(f"/api/public/portals/{slug}/news/{news_id}")
-        if r.is_error:
-            raise RuntimeError(f"Public verification failed: {r.status_code}: {r.text[:1000]}")
-        return {"verified": True, "status_code": r.status_code, "news": r.json()}
+    if not PORTAL_SLUG:
+        raise RuntimeError("NEDS_PORTAL_SLUG is required for publication verification")
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{CMS_BASE_URL}/api/public/portals/{PORTAL_SLUG}/news/{news_id}")
+        r.raise_for_status()
+        return r.json()
 
 
 if __name__ == "__main__":
